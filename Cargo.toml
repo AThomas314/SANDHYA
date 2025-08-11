@@ -1,0 +1,12 @@
+[package]
+name = "SANDHYA"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.32.0"
+ndarray = { version = "0.16.1", features = ["rayon"] }
+ndarray-rand = "0.15.0"
+rayon = "1.10.0"
+strum = "0.27.2"
+strum_macros = "0.27.2"
