@@ -8,6 +8,7 @@ use gui::MyEguiApp;
 fn main() {
     let native_options = eframe::NativeOptions {
         viewport: ViewportBuilder::default().with_fullscreen(true),
+
         ..Default::default()
     };
     let _ = run_native(

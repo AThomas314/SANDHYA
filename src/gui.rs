@@ -1,199 +1,235 @@
-use crate::distributions::{DistributionInputStrings, Distributions};
-use crate::mcs::run_simulation;
+use crate::distributions::{DistributionInputs, Distributions};
+use crate::mcs::start_simulation;
 use eframe::egui;
 use std::collections::HashMap;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 use strum::IntoEnumIterator;
 
+type SimulationResult = Result<(), String>;
+
+// The main application state
 #[derive(Default)]
 pub struct MyEguiApp {
-    commissionstr: DistributionInputStrings,
+    // Single numeric values are now stored directly as f64.
+    commission: f64,
+    number_of_months: f64,
+    number_of_trials: f64,
+
     error_message: String,
     show_error_popup: bool,
 
+    // Each variable that uses a distribution has its own state.
     price_distr: Distributions,
-    price_inputs: DistributionInputStrings,
+    price_inputs: DistributionInputs,
 
     retailers_day_distr: Distributions,
-    retailers_day_inputs: DistributionInputStrings,
+    retailers_day_inputs: DistributionInputs,
+
+    units_sale_distr: Distributions,
+    units_sale_inputs: DistributionInputs,
 
     workdays_month_distr: Distributions,
-    workdays_month_inputs: DistributionInputStrings,
+    workdays_month_inputs: DistributionInputs,
 
     conversion_rate_distr: Distributions,
-    conversion_rate_inputs: DistributionInputStrings,
+    conversion_rate_inputs: DistributionInputs,
 
-    number_of_trials: DistributionInputStrings,
-    data: HashMap<String, (Distributions, DistributionInputStrings)>,
+    // This will hold the final, validated data for the simulation.
+    data: HashMap<String, (Distributions, DistributionInputs)>,
+    probability_distributions: Vec<Distributions>,
+    is_simulating: bool,
+    simulation_receiver: Option<Receiver<SimulationResult>>,
+    simulation_result: Option<SimulationResult>,
 }
 
 impl MyEguiApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        Self::default()
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let mut style = (*cc.egui_ctx.style()).clone();
+        style.animation_time = 0.0;
+        cc.egui_ctx.set_style(style);
+        Self {
+            number_of_months: 12.0,
+            number_of_trials: 1000.0,
+            probability_distributions: Distributions::iter().collect(),
+            ..Default::default()
+        }
     }
-    fn gather_values(&mut self, ui: &mut egui::Ui) -> Option<String> {
-        let start_button = egui::Button::new("Start Simulation");
-        if ui.add(start_button).clicked() {
-            let commision = (Distributions::Constant, self.commissionstr.clone());
-            let prices: (Distributions, DistributionInputStrings) =
-                (self.price_distr, self.price_inputs.clone());
-            let retailers_per_day: (Distributions, DistributionInputStrings) =
-                (self.retailers_day_distr, self.retailers_day_inputs.clone());
-            let workdays_per_month: (Distributions, DistributionInputStrings) = (
+
+    /// Gathers and validates all user inputs.
+    /// This is now called only when the "Start Simulation" button is clicked.
+    fn gather_and_validate_values(&mut self) -> Result<(), String> {
+        // --- Validation Logic ---
+        // This helper function reduces code duplication for validation.
+        let validate =
+            |dist: &Distributions, inputs: &DistributionInputs, name: &str| -> Result<(), String> {
+                match dist {
+                    Distributions::Uniform => {
+                        if inputs.uniform_min > inputs.uniform_max {
+                            return Err(format!("For {}, ensure min <= max.", name));
+                        }
+                    }
+                    Distributions::Triangular => {
+                        if !(inputs.triangular_min <= inputs.triangular_mode
+                            && inputs.triangular_mode <= inputs.triangular_max)
+                        {
+                            return Err(format!("For {}, ensure min <= mode <= max.", name));
+                        }
+                    }
+                    Distributions::Pert => {
+                        if !(inputs.pert_min <= inputs.pert_mode
+                            && inputs.pert_mode <= inputs.pert_max)
+                        {
+                            return Err(format!("For {}, ensure min <= mode <= max.", name));
+                        }
+                    }
+                    _ => {} // Other distributions have no logical constraints here.
+                }
+                Ok(())
+            };
+
+        // Validate all inputs that have logical constraints.
+        validate(&self.price_distr, &self.price_inputs, "Price")?;
+        validate(
+            &self.retailers_day_distr,
+            &self.retailers_day_inputs,
+            "Retailers/Day",
+        )?;
+        validate(
+            &self.workdays_month_distr,
+            &self.workdays_month_inputs,
+            "Workdays/Month",
+        )?;
+        validate(
+            &self.units_sale_distr,
+            &self.units_sale_inputs,
+            "Units/Sale",
+        )?;
+        validate(
+            &self.conversion_rate_distr,
+            &self.conversion_rate_inputs,
+            "Conversion Rate",
+        )?;
+
+        // --- Data Gathering ---
+        let mut hm: HashMap<String, (Distributions, DistributionInputs)> = HashMap::new();
+        hm.insert(
+            "Prices".into(),
+            (self.price_distr, self.price_inputs.clone()),
+        );
+        hm.insert(
+            "Retailers_per_Day".into(),
+            (self.retailers_day_distr, self.retailers_day_inputs.clone()),
+        );
+        hm.insert(
+            "Workdays_per_Month".into(),
+            (
                 self.workdays_month_distr,
                 self.workdays_month_inputs.clone(),
-            );
-            let conversion_rate: (Distributions, DistributionInputStrings) = (
+            ),
+        );
+        hm.insert(
+            "Conversion_Rate".into(),
+            (
                 self.conversion_rate_distr,
                 self.conversion_rate_inputs.clone(),
-            );
-            let trials: (Distributions, DistributionInputStrings) =
-                (Distributions::Constant, self.number_of_trials.clone());
+            ),
+        );
+        hm.insert(
+            "Units".into(),
+            (self.units_sale_distr, self.units_sale_inputs.clone()),
+        );
 
-            if !&commision.1.is_any_field_filled()
-                || !&prices.1.is_any_field_filled()
-                || !&retailers_per_day.1.is_any_field_filled()
-                || !&workdays_per_month.1.is_any_field_filled()
-                || !&conversion_rate.1.is_any_field_filled()
-                || !&trials.1.is_any_field_filled()
-            {
-                return Some("Please fill all fields before running the simulation".to_string());
-            } else {
-                let mut hm: HashMap<String, (Distributions, DistributionInputStrings)> =
-                    HashMap::new();
-                hm.insert("Prices".into(), prices);
-                hm.insert("Retailers_per_Day".into(), retailers_per_day);
-                hm.insert("Workdays_per_Month".into(), workdays_per_month);
-                hm.insert("Conversion_Rate".into(), conversion_rate);
-                hm.insert("Commission_Rate".into(), commision);
-                hm.insert("Trials".into(), trials);
-                self.data = hm;
-                return None;
-            };
-        }
-        None
+        // For single values, we create a temporary DistributionInputs struct.
+        let commission_inputs = DistributionInputs {
+            constant_val: self.commission,
+            ..Default::default()
+        }; // Convert percentage
+        let trials_inputs = DistributionInputs {
+            constant_val: self.number_of_trials,
+            ..Default::default()
+        };
+        let months_inputs = DistributionInputs {
+            constant_val: self.number_of_months,
+            ..Default::default()
+        };
+
+        hm.insert(
+            "Commission_Rate".into(),
+            (Distributions::Constant, commission_inputs),
+        );
+        hm.insert("Trials".into(), (Distributions::Constant, trials_inputs));
+        hm.insert(
+            "Number_of_Months".into(),
+            (Distributions::Constant, months_inputs),
+        );
+
+        self.data = hm;
+        Ok(())
     }
 
+    /// Renders the UI for selecting a distribution and its parameters.
     fn input_distributions(
         ui: &mut egui::Ui,
         distribution: Distributions,
-        inputs: &mut DistributionInputStrings,
-    ) -> Option<String> {
+        inputs: &mut DistributionInputs,
+    ) {
         match distribution {
             Distributions::Bernoulli => {
                 ui.label("Probability");
-                ui.add(egui::TextEdit::singleline(&mut inputs.bernoulli_prob_str));
-
-                if !inputs.bernoulli_prob_str.is_empty() {
-                    match inputs.bernoulli_prob_str.parse::<f64>() {
-                        Ok(p_val) => {
-                            if p_val < 0.0 || p_val > 1.0 {
-                                return Some(
-                                    "Probability must be between 0.0 and 1.0.".to_string(),
-                                );
-                            }
-                        }
-                        Err(_) => {
-                            return Some(format!(
-                                "Invalid number for probability: {}",
-                                inputs.bernoulli_prob_str
-                            ));
-                        }
-                    };
-                }
+                ui.add(
+                    egui::DragValue::new(&mut inputs.bernoulli_prob)
+                        .speed(0.01)
+                        .range(0.0..=1.0),
+                );
             }
             Distributions::Normal => {
                 ui.label("Mean");
-                ui.add(egui::TextEdit::singleline(&mut inputs.normal_mean_str));
+                ui.add(egui::DragValue::new(&mut inputs.normal_mean).speed(0.1));
                 ui.label("Standard Deviation");
-                ui.add(egui::TextEdit::singleline(&mut inputs.normal_std_str));
-
-                if !inputs.normal_mean_str.is_empty() {
-                    if let Err(e) = inputs.normal_mean_str.parse::<f64>() {
-                        return Some(format!("Invalid number for mean: {}", e));
-                    }
-                }
-                if !inputs.normal_std_str.is_empty() {
-                    if let Err(e) = inputs.normal_std_str.parse::<f64>() {
-                        return Some(format!("Invalid number for standard deviation: {}", e));
-                    }
-                }
+                ui.add(
+                    egui::DragValue::new(&mut inputs.normal_std)
+                        .speed(0.1)
+                        .range(0.0..=f64::INFINITY),
+                );
             }
             Distributions::Uniform => {
                 ui.label("Min");
-                ui.add(egui::TextEdit::singleline(&mut inputs.uniform_min_str));
+                ui.add(egui::DragValue::new(&mut inputs.uniform_min).speed(0.1));
                 ui.label("Max");
-                ui.add(egui::TextEdit::singleline(&mut inputs.uniform_max_str));
-
-                if !inputs.uniform_min_str.is_empty() {
-                    if let Err(e) = inputs.uniform_min_str.parse::<f64>() {
-                        return Some(format!("Invalid number for minimum value: {}", e));
-                    }
-                }
-                if !inputs.uniform_max_str.is_empty() {
-                    if let Err(e) = inputs.uniform_max_str.parse::<f64>() {
-                        return Some(format!("Invalid number for maximum value: {}", e));
-                    }
-                }
+                ui.add(egui::DragValue::new(&mut inputs.uniform_max).speed(0.1));
             }
             Distributions::Constant => {
                 ui.label("Value");
-                ui.add(egui::TextEdit::singleline(&mut inputs.constant_val_str));
-
-                if !inputs.constant_val_str.is_empty() {
-                    if let Err(e) = inputs.constant_val_str.parse::<f64>() {
-                        return Some(format!("Invalid number for constant value: {}", e));
-                    }
-                }
+                ui.add(egui::DragValue::new(&mut inputs.constant_val).speed(0.1));
             }
-        }
-        None
-    }
-
-    fn show_trials_input(&mut self, ui: &mut egui::Ui) -> Option<String> {
-        ui.horizontal(|ui| {
-            ui.label("Number of trials");
-            ui.add(egui::TextEdit::singleline(
-                &mut self.number_of_trials.constant_val_str,
-            ));
-        });
-
-        if !self.number_of_trials.constant_val_str.is_empty() {
-            if let Err(e) = self.number_of_trials.constant_val_str.parse::<f64>() {
-                return Some(format!("Invalid number for constant value: {}", e));
-            } else {
-                None
+            Distributions::Triangular => {
+                ui.label("Min");
+                ui.add(egui::DragValue::new(&mut inputs.triangular_min).speed(0.1));
+                ui.label("Mode");
+                ui.add(egui::DragValue::new(&mut inputs.triangular_mode).speed(0.1));
+                ui.label("Max");
+                ui.add(egui::DragValue::new(&mut inputs.triangular_max).speed(0.1));
             }
-        } else {
-            None
-        }
-    }
-    fn show_commission_input(&mut self, ui: &mut egui::Ui) -> Option<String> {
-        ui.horizontal(|ui| {
-            ui.label("Commission rate");
-            ui.add(egui::TextEdit::singleline(
-                &mut self.commissionstr.constant_val_str,
-            ));
-            ui.label("%");
-        });
-        if !self.commissionstr.constant_val_str.is_empty() {
-            if let Err(e) = self.commissionstr.constant_val_str.parse::<f64>() {
-                return Some(format!("Invalid number for constant value: {}", e));
-            } else {
-                None
+            Distributions::Pert => {
+                ui.label("Min");
+                ui.add(egui::DragValue::new(&mut inputs.pert_min).speed(0.1));
+                ui.label("Mode");
+                ui.add(egui::DragValue::new(&mut inputs.pert_mode).speed(0.1));
+                ui.label("Max");
+                ui.add(egui::DragValue::new(&mut inputs.pert_max).speed(0.1));
             }
-        } else {
-            None
         }
     }
 
+    /// A helper function to create a row for a distribution selector.
     fn show_distribution_controls(
         ui: &mut egui::Ui,
         label_text: &str,
         distribution: &mut Distributions,
-        inputs: &mut DistributionInputStrings,
+        inputs: &mut DistributionInputs,
         options: &Vec<Distributions>,
-    ) -> Option<String> {
-        let mut error = None;
+    ) {
         ui.horizontal(|ui| {
             ui.label(label_text);
             egui::ComboBox::from_label(format!("Select a distribution for {}", label_text))
@@ -203,85 +239,133 @@ impl MyEguiApp {
                         ui.selectable_value(distribution, *option, option.to_string());
                     }
                 });
-            error = Self::input_distributions(ui, *distribution, inputs);
+            Self::input_distributions(ui, *distribution, inputs);
         });
-        error
     }
 }
 
 impl eframe::App for MyEguiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let probability_distributions: Vec<Distributions> = Distributions::iter().collect();
-        let mut errors: Vec<String> = Vec::new();
-
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("SANDHYA");
+            ui.heading("Monte Carlo Simulation");
+            ui.add_space(10.0);
 
-            if let Some(err) = self.show_commission_input(ui) {
-                errors.push(err);
-            }
+            // --- DRAWING PHASE ---
+            // The UI is drawn here. No validation or logic is performed in this phase.
+            ui.add_enabled_ui(!self.is_simulating, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Commission rate");
+                    ui.add(egui::DragValue::new(&mut self.commission).range(0.0..=100.0));
+                    ui.label("%");
+                });
 
-            if let Some(err) = Self::show_distribution_controls(
-                ui,
-                "Price to retailer",
-                &mut self.price_distr,
-                &mut self.price_inputs,
-                &probability_distributions,
-            ) {
-                errors.push(err);
-            }
-            if let Some(err) = Self::show_distribution_controls(
-                ui,
-                "Retailers/Day",
-                &mut self.retailers_day_distr,
-                &mut self.retailers_day_inputs,
-                &probability_distributions,
-            ) {
-                errors.push(err);
-            }
-            if let Some(err) = Self::show_distribution_controls(
-                ui,
-                "Workdays/Month",
-                &mut self.workdays_month_distr,
-                &mut self.workdays_month_inputs,
-                &probability_distributions,
-            ) {
-                errors.push(err);
-            }
-            if let Some(err) = Self::show_distribution_controls(
-                ui,
-                "Conversion Rate",
-                &mut self.conversion_rate_distr,
-                &mut self.conversion_rate_inputs,
-                &probability_distributions,
-            ) {
-                errors.push(err);
-            }
-            if let Some(err) = self.show_trials_input(ui) {
-                errors.push(err);
-            }
+                Self::show_distribution_controls(
+                    ui,
+                    "Price to retailer",
+                    &mut self.price_distr,
+                    &mut self.price_inputs,
+                    &self.probability_distributions,
+                );
+                Self::show_distribution_controls(
+                    ui,
+                    "Retailers/Day",
+                    &mut self.retailers_day_distr,
+                    &mut self.retailers_day_inputs,
+                    &self.probability_distributions,
+                );
+                Self::show_distribution_controls(
+                    ui,
+                    "Workdays/Month",
+                    &mut self.workdays_month_distr,
+                    &mut self.workdays_month_inputs,
+                    &self.probability_distributions,
+                );
+                Self::show_distribution_controls(
+                    ui,
+                    "Units/Sale",
+                    &mut self.units_sale_distr,
+                    &mut self.units_sale_inputs,
+                    &self.probability_distributions,
+                );
+                Self::show_distribution_controls(
+                    ui,
+                    "Conversion Rate",
+                    &mut self.conversion_rate_distr,
+                    &mut self.conversion_rate_inputs,
+                    &self.probability_distributions,
+                );
 
-            if let Some(err) = self.gather_values(ui) {
-                errors.push(err);
-            } else {
-                run_simulation(&self.data)
-            };
+                ui.horizontal(|ui| {
+                    ui.label("Number of Months");
+                    ui.add(
+                        egui::DragValue::new(&mut self.number_of_months).range(1.0..=f64::INFINITY),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Number of Trials");
+                    ui.add(
+                        egui::DragValue::new(&mut self.number_of_trials).range(1.0..=f64::INFINITY),
+                    );
+                });
+
+                ui.add_space(10.0);
+
+                // --- EVENT HANDLING PHASE ---
+                // Logic is only executed when the user clicks the button.
+                let start_button = ui.button("Start Simulation");
+                if start_button.clicked() && !self.is_simulating {
+                    match self.gather_and_validate_values() {
+                        Ok(()) => {
+                            self.is_simulating = true;
+                            self.simulation_result = None;
+                            let (sender, receiver) = mpsc::channel();
+                            self.simulation_receiver = Some(receiver);
+                            let simulation_data = self.data.clone();
+                            thread::spawn(move || {
+                                let result = start_simulation(&simulation_data);
+                                sender.send(Ok(result)).ok();
+                            });
+                            println!("Running Simulation With {:#?}", &self.data);
+                        }
+                        Err(err) => {
+                            self.error_message = err;
+                            self.show_error_popup = true;
+                        }
+                    }
+                }
+            });
+
+            if self.is_simulating {
+                if let Some(receiver) = &self.simulation_receiver {
+                    // .try_recv() is non-blocking. It instantly returns a result if one is available.
+                    if let Ok(result) = receiver.try_recv() {
+                        println!("Simulation finished. Got result.");
+                        self.simulation_result = Some(result);
+                        self.is_simulating = false; // The simulation is done
+                        self.simulation_receiver = None; // Clean up the channel
+                    }
+                }
+
+                ui.spinner();
+            }
         });
-        if !errors.is_empty() {
-            self.error_message = errors.join("\n");
-            self.show_error_popup = true;
-        }
 
+        // --- POPUP DISPLAY ---
+        // This reads the state set in the event handling phase. It doesn't modify state itself.
         if self.show_error_popup {
             egui::Window::new("Error")
                 .collapsible(false)
                 .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .show(ctx, |ui| {
                     ui.label(&self.error_message);
+                    ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        if ui.button("OK").clicked() {
-                            self.show_error_popup = false;
-                        }
+                        ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                            if ui.button("OK").clicked() {
+                                self.show_error_popup = false;
+                            }
+                        });
                     });
                 });
         }
