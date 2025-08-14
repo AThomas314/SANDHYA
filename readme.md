@@ -1,1 +1,2 @@
-Strategic And Numerical Distributor Hypothetical Yield Analyzer (SANDHYA)
+Stochastic And Numerical Distributor Hypothetical Income Yield Analyzer (SANDHIYA)
+

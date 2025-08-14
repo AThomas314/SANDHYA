@@ -1,25 +1,23 @@
 use crate::distributions::{DistributionInputs, Distributions};
 use crate::mcs::start_simulation;
+use crate::message::SimulationMessage;
 use eframe::egui;
-use std::collections::HashMap;
-use std::sync::mpsc::{self, Receiver};
-use std::thread;
-use strum::IntoEnumIterator;
+use std::{
+    collections::HashMap,
+    sync::mpsc::{self, Receiver},
+    thread,
+};
+use strum::IntoEnumIterator; 
 
-type SimulationResult = Result<(), String>;
-
-// The main application state
 #[derive(Default)]
 pub struct MyEguiApp {
-    // Single numeric values are now stored directly as f64.
     commission: f64,
     number_of_months: f64,
     number_of_trials: f64,
-
+    transport_bonus: f64,
     error_message: String,
     show_error_popup: bool,
 
-    // Each variable that uses a distribution has its own state.
     price_distr: Distributions,
     price_inputs: DistributionInputs,
 
@@ -35,12 +33,12 @@ pub struct MyEguiApp {
     conversion_rate_distr: Distributions,
     conversion_rate_inputs: DistributionInputs,
 
-    // This will hold the final, validated data for the simulation.
     data: HashMap<String, (Distributions, DistributionInputs)>,
     probability_distributions: Vec<Distributions>,
     is_simulating: bool,
-    simulation_receiver: Option<Receiver<SimulationResult>>,
-    simulation_result: Option<SimulationResult>,
+    progress: f32,
+    simulation_receiver: Option<Receiver<SimulationMessage>>,
+    simulation_result: Option<SimulationMessage>,
 }
 
 impl MyEguiApp {
@@ -51,7 +49,9 @@ impl MyEguiApp {
         Self {
             number_of_months: 12.0,
             number_of_trials: 1000.0,
-            probability_distributions: Distributions::iter().collect(),
+            probability_distributions: Distributions::iter()
+                .filter(|&dist| dist != Distributions::Bernoulli)
+                .collect(),
             ..Default::default()
         }
     }
@@ -140,11 +140,14 @@ impl MyEguiApp {
             (self.units_sale_distr, self.units_sale_inputs.clone()),
         );
 
-        // For single values, we create a temporary DistributionInputs struct.
         let commission_inputs = DistributionInputs {
             constant_val: self.commission,
             ..Default::default()
-        }; // Convert percentage
+        };
+        let transport_bonus_inputs = DistributionInputs {
+            constant_val: self.transport_bonus,
+            ..Default::default()
+        };
         let trials_inputs = DistributionInputs {
             constant_val: self.number_of_trials,
             ..Default::default()
@@ -157,6 +160,10 @@ impl MyEguiApp {
         hm.insert(
             "Commission_Rate".into(),
             (Distributions::Constant, commission_inputs),
+        );
+        hm.insert(
+            "Transport_Bonus".into(),
+            (Distributions::Constant, transport_bonus_inputs),
         );
         hm.insert("Trials".into(), (Distributions::Constant, trials_inputs));
         hm.insert(
@@ -258,6 +265,11 @@ impl eframe::App for MyEguiApp {
                     ui.add(egui::DragValue::new(&mut self.commission).range(0.0..=100.0));
                     ui.label("%");
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Transport Bonus");
+                    ui.add(egui::DragValue::new(&mut self.transport_bonus).range(0.0..=100.0));
+                    ui.label("%");
+                });
 
                 Self::show_distribution_controls(
                     ui,
@@ -318,14 +330,23 @@ impl eframe::App for MyEguiApp {
                         Ok(()) => {
                             self.is_simulating = true;
                             self.simulation_result = None;
-                            let (sender, receiver) = mpsc::channel();
+                            let (sender, receiver) = mpsc::channel::<SimulationMessage>();
                             self.simulation_receiver = Some(receiver);
                             let simulation_data = self.data.clone();
+                            let progress_sender = sender.clone();
+
                             thread::spawn(move || {
-                                let result = start_simulation(&simulation_data);
-                                sender.send(Ok(result)).ok();
+                                let result =
+                                    start_simulation(&simulation_data, Some(progress_sender));
+                                match result {
+                                    Ok(_) => {
+                                        sender.send(SimulationMessage::Success("".into())).ok()
+                                    }
+                                    Err(e) => {
+                                        sender.send(SimulationMessage::Error(e.to_string())).ok()
+                                    }
+                                };
                             });
-                            println!("Running Simulation With {:#?}", &self.data);
                         }
                         Err(err) => {
                             self.error_message = err;
@@ -337,15 +358,15 @@ impl eframe::App for MyEguiApp {
 
             if self.is_simulating {
                 if let Some(receiver) = &self.simulation_receiver {
-                    // .try_recv() is non-blocking. It instantly returns a result if one is available.
                     if let Ok(result) = receiver.try_recv() {
-                        println!("Simulation finished. Got result.");
                         self.simulation_result = Some(result);
                         self.is_simulating = false; // The simulation is done
                         self.simulation_receiver = None; // Clean up the channel
                     }
                 }
-
+                ui.add_space(10.0);
+                ui.add(egui::ProgressBar::new(self.progress).show_percentage());
+                ui.add_space(5.0);
                 ui.spinner();
             }
         });

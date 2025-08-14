@@ -1,12 +1,14 @@
 [package]
-name = "SANDHYA"
+name = "SANDHIYA"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 eframe = "0.32.0"
 ndarray = { version = "0.16.1", features = ["rayon"] }
+ndarray-linalg = "0.17.0"
 ndarray-rand = "0.15.0"
+opener = "0.8.2"
 polars = { version = "0.50.0", features = ["lazy", "ndarray", "parquet"] }
 rayon = "1.10.0"
 strum = "0.27.2"

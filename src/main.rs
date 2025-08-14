@@ -2,8 +2,10 @@ mod gui;
 use eframe::egui::ViewportBuilder;
 mod distributions;
 mod mcs;
+mod message;
 use eframe::run_native;
 use gui::MyEguiApp;
+mod errors;
 
 fn main() {
     let native_options = eframe::NativeOptions {
@@ -12,7 +14,7 @@ fn main() {
         ..Default::default()
     };
     let _ = run_native(
-        "SANDHYA",
+        "SANDHIYA",
         native_options,
         Box::new(|cc| Ok(Box::new(MyEguiApp::new(cc)))),
     );
